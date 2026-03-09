@@ -1,118 +1,142 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Brain, Loader2, Dumbbell, RefreshCw, ChevronDown, ChevronUp } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { Brain, Send, Loader2, Dumbbell, ChevronDown, ChevronUp, RefreshCw, MessageCircle } from "lucide-react";
 import {
   getTrainingPlan,
   saveTrainingPlan,
-  getTrainerProfile,
-  saveTrainerProfile,
   type TrainingPlan,
-  type TrainerProfile,
   type WorkoutDay,
 } from "@/lib/training-plan-db";
-import { db } from "@/lib/db";
 
-const EXPERIENCE_LEVELS = ["Beginner", "Intermediate", "Advanced"];
-const EQUIPMENT_OPTIONS = [
-  "Full Gym",
-  "Home Gym (Barbell + Rack)",
-  "Dumbbells Only",
-  "Bodyweight Only",
-  "Gym — No Free Weights",
-];
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
 
 export default function TrainerPage() {
   const [plan, setPlan] = useState<TrainingPlan | null>(null);
-  const [profile, setProfile] = useState<TrainerProfile>({
-    goals: "",
-    experienceLevel: "Beginner",
-    daysPerWeek: 4,
-    equipment: "Full Gym",
-    injuries: "",
-  });
+  const [view, setView] = useState<"plan" | "chat">("plan");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [expandedDay, setExpandedDay] = useState<number | null>(null);
-  const [showForm, setShowForm] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    loadData();
+    loadPlan();
   }, []);
 
-  const loadData = async () => {
-    const existingPlan = await getTrainingPlan();
-    if (existingPlan) setPlan(existingPlan);
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
 
-    const existingProfile = await getTrainerProfile();
-    if (existingProfile) {
-      setProfile(existingProfile);
-      if (!existingPlan) setShowForm(true);
+  const loadPlan = async () => {
+    const existing = await getTrainingPlan();
+    if (existing) {
+      setPlan(existing);
+      setView("plan");
     } else {
-      setShowForm(true);
+      startNewChat();
     }
   };
 
-  const generatePlan = async () => {
+  const startNewChat = () => {
+    setMessages([]);
+    setView("chat");
+    // Send initial greeting after a tick so UI renders first
+    setTimeout(() => sendInitialGreeting(), 100);
+  };
+
+  const sendInitialGreeting = async () => {
     setLoading(true);
-    setError(null);
-
     try {
-      await saveTrainerProfile(profile);
+      const initialMessages: ChatMessage[] = [
+        { role: "user", content: "Hi, I'd like help creating a workout plan." },
+      ];
 
-      // Get recent workout data for context
-      const allSets = await db.workoutSets.toArray();
-      const recentSets = allSets.slice(-100).map((s) => ({
-        date: s.date,
-        exercise_name: s.exerciseName,
-        actual_weight: String(s.actualWeight ?? ""),
-        actual_reps: String(s.actualReps ?? ""),
-        difficulty: String(s.rpe ?? ""),
-      }));
-
-      const lastBody = await db.bodyMeasurements.orderBy("date").last();
-
-      const res = await fetch("/api/ai/trainer", {
+      const res = await fetch("/api/ai/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "generate",
-          goals: profile.goals,
-          experienceLevel: profile.experienceLevel,
-          daysPerWeek: profile.daysPerWeek,
-          equipment: profile.equipment,
-          injuries: profile.injuries,
-          recentWorkouts: recentSets,
-          bodyWeight: lastBody?.bodyWeight ? String(lastBody.bodyWeight) : undefined,
-        }),
+        body: JSON.stringify({ messages: initialMessages }),
       });
 
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Failed to generate plan");
-      }
+      if (!res.ok) throw new Error("Failed to connect to AI coach");
+
+      const data = await res.json();
+      setMessages([
+        { role: "assistant", content: data.text },
+      ]);
+    } catch {
+      setMessages([
+        {
+          role: "assistant",
+          content: "Hey! I'm your AI coach. Tell me about your fitness goals and I'll build you a personalized training program. What are you looking to achieve?",
+        },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const sendMessage = async () => {
+    if (!input.trim() || loading) return;
+
+    const userMessage: ChatMessage = { role: "user", content: input.trim() };
+    const updatedMessages = [...messages, userMessage];
+    setMessages(updatedMessages);
+    setInput("");
+    setLoading(true);
+
+    try {
+      const res = await fetch("/api/ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: updatedMessages }),
+      });
+
+      if (!res.ok) throw new Error("Failed to get response");
 
       const data = await res.json();
 
-      if (!data.plan || !Array.isArray(data.plan)) {
-        throw new Error("AI did not return a valid training plan");
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: data.text },
+      ]);
+
+      // If a plan was generated, save it
+      if (data.plan && Array.isArray(data.plan)) {
+        const newPlan: TrainingPlan = {
+          overview: data.text.split("\n").slice(0, 3).join(" ").substring(0, 300),
+          days: data.plan,
+          goals: messages.find((m) => m.role === "user")?.content || "",
+          createdAt: new Date().toISOString(),
+          currentDayIndex: 0,
+        };
+        await saveTrainingPlan(newPlan);
+        setPlan(newPlan);
+
+        // After a moment, switch to plan view
+        setTimeout(() => setView("plan"), 2000);
       }
-
-      const newPlan: TrainingPlan = {
-        overview: data.overview || "",
-        days: data.plan,
-        goals: profile.goals,
-        createdAt: new Date().toISOString(),
-        currentDayIndex: 0,
-      };
-
-      await saveTrainingPlan(newPlan);
-      setPlan(newPlan);
-      setShowForm(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "Sorry, I had trouble responding. Please try again.",
+        },
+      ]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
     }
   };
 
@@ -120,8 +144,87 @@ export default function TrainerPage() {
     setExpandedDay(expandedDay === dayNum ? null : dayNum);
   };
 
-  // No plan and no form — show setup prompt
-  if (!plan && !showForm) {
+  // Chat view
+  if (view === "chat") {
+    return (
+      <div className="flex flex-col h-screen">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Brain size={20} className="text-indigo-400" />
+            <h1 className="text-lg font-semibold">AI Coach</h1>
+          </div>
+          {plan && (
+            <button
+              onClick={() => setView("plan")}
+              className="text-sm text-indigo-400"
+            >
+              View Plan
+            </button>
+          )}
+        </div>
+
+        {/* Messages */}
+        <div className="flex-1 overflow-y-auto no-scrollbar px-4 py-4 pb-32">
+          {messages.map((msg, i) => (
+            <div
+              key={i}
+              className={`mb-4 flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+            >
+              <div
+                className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+                  msg.role === "user"
+                    ? "bg-indigo-600 text-white"
+                    : "bg-slate-800 text-slate-200"
+                }`}
+              >
+                {msg.content.split("\n").map((line, j) => (
+                  <p key={j} className={`text-sm ${j > 0 ? "mt-2" : ""}`}>
+                    {line}
+                  </p>
+                ))}
+              </div>
+            </div>
+          ))}
+
+          {loading && (
+            <div className="mb-4 flex justify-start">
+              <div className="rounded-2xl bg-slate-800 px-4 py-3">
+                <Loader2 size={16} className="animate-spin text-indigo-400" />
+              </div>
+            </div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        {/* Input */}
+        <div className="fixed bottom-16 left-0 right-0 border-t border-slate-800 bg-slate-950 px-4 py-3 pb-safe">
+          <div className="flex items-end gap-2">
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Tell your coach..."
+              rows={1}
+              className="flex-1 resize-none rounded-xl bg-slate-800 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500 focus:ring-1 focus:ring-indigo-500"
+              style={{ maxHeight: "120px" }}
+            />
+            <button
+              onClick={sendMessage}
+              disabled={!input.trim() || loading}
+              className="rounded-xl bg-indigo-600 p-3 text-white transition-colors hover:bg-indigo-500 disabled:opacity-40"
+            >
+              <Send size={18} />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Plan view
+  if (!plan) {
     return (
       <div className="flex flex-col items-center justify-center px-6 pt-16">
         <div className="mb-8 rounded-full bg-indigo-500/10 p-6">
@@ -129,163 +232,44 @@ export default function TrainerPage() {
         </div>
         <h1 className="mb-2 text-2xl font-bold">AI Trainer</h1>
         <p className="mb-8 text-center text-sm text-slate-400">
-          Get a personalized training program built by AI
+          Chat with your AI coach to build a personalized training program
         </p>
         <button
-          onClick={() => setShowForm(true)}
+          onClick={startNewChat}
           className="w-full max-w-xs rounded-xl bg-indigo-600 px-6 py-4 text-lg font-semibold text-white"
         >
-          Set Up My Program
+          Talk to Coach
         </button>
       </div>
     );
   }
 
-  // Show goal/profile form
-  if (showForm) {
-    return (
-      <div className="flex flex-col px-4 pt-6 pb-24">
-        <h1 className="mb-2 text-2xl font-bold">AI Trainer</h1>
-        <p className="mb-6 text-sm text-slate-400">
-          Tell me about yourself and your goals
-        </p>
-
-        {/* Goals */}
-        <label className="mb-1 text-xs font-medium text-slate-400">
-          What are your goals?
-        </label>
-        <textarea
-          value={profile.goals}
-          onChange={(e) => setProfile((p) => ({ ...p, goals: e.target.value }))}
-          placeholder="e.g., Build muscle and strength, focus on upper body, improve bench press to 225lb, lose body fat while maintaining muscle..."
-          rows={4}
-          className="mb-4 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-600 focus:border-indigo-500"
-        />
-
-        {/* Experience */}
-        <label className="mb-1 text-xs font-medium text-slate-400">
-          Experience Level
-        </label>
-        <div className="mb-4 flex gap-2">
-          {EXPERIENCE_LEVELS.map((level) => (
-            <button
-              key={level}
-              onClick={() => setProfile((p) => ({ ...p, experienceLevel: level }))}
-              className={`flex-1 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
-                profile.experienceLevel === level
-                  ? "bg-indigo-600 text-white"
-                  : "bg-slate-800 text-slate-400"
-              }`}
-            >
-              {level}
-            </button>
-          ))}
-        </div>
-
-        {/* Days per week */}
-        <label className="mb-1 text-xs font-medium text-slate-400">
-          Days per Week
-        </label>
-        <div className="mb-4 flex gap-2">
-          {[2, 3, 4, 5, 6].map((n) => (
-            <button
-              key={n}
-              onClick={() => setProfile((p) => ({ ...p, daysPerWeek: n }))}
-              className={`flex-1 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
-                profile.daysPerWeek === n
-                  ? "bg-indigo-600 text-white"
-                  : "bg-slate-800 text-slate-400"
-              }`}
-            >
-              {n}
-            </button>
-          ))}
-        </div>
-
-        {/* Equipment */}
-        <label className="mb-1 text-xs font-medium text-slate-400">
-          Equipment Available
-        </label>
-        <div className="mb-4 flex flex-wrap gap-2">
-          {EQUIPMENT_OPTIONS.map((eq) => (
-            <button
-              key={eq}
-              onClick={() => setProfile((p) => ({ ...p, equipment: eq }))}
-              className={`rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
-                profile.equipment === eq
-                  ? "bg-indigo-600 text-white"
-                  : "bg-slate-800 text-slate-400"
-              }`}
-            >
-              {eq}
-            </button>
-          ))}
-        </div>
-
-        {/* Injuries */}
-        <label className="mb-1 text-xs font-medium text-slate-400">
-          Injuries or Limitations (optional)
-        </label>
-        <textarea
-          value={profile.injuries}
-          onChange={(e) => setProfile((p) => ({ ...p, injuries: e.target.value }))}
-          placeholder="e.g., Bad left shoulder, lower back issues, knee pain during squats..."
-          rows={2}
-          className="mb-6 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-600 focus:border-indigo-500"
-        />
-
-        {error && (
-          <p className="mb-4 text-center text-sm text-red-400">{error}</p>
-        )}
-
-        <button
-          onClick={generatePlan}
-          disabled={loading || !profile.goals}
-          className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-4 text-base font-semibold text-white transition-colors hover:bg-indigo-500 disabled:opacity-50"
-        >
-          {loading ? (
-            <>
-              <Loader2 size={20} className="animate-spin" />
-              Generating Plan...
-            </>
-          ) : (
-            <>
-              <Brain size={20} />
-              Generate My Training Plan
-            </>
-          )}
-        </button>
-
-        {plan && (
-          <button
-            onClick={() => setShowForm(false)}
-            className="mt-3 w-full rounded-xl border border-slate-700 py-3 text-sm text-slate-400"
-          >
-            Cancel — Keep Current Plan
-          </button>
-        )}
-      </div>
-    );
-  }
-
-  // Show the plan
   return (
     <div className="flex flex-col px-4 pt-6 pb-24">
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-2xl font-bold">My Program</h1>
-        <button
-          onClick={() => setShowForm(true)}
-          className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-medium text-slate-300"
-        >
-          <RefreshCw size={14} />
-          New Plan
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setView("chat")}
+            className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-medium text-slate-300"
+          >
+            <MessageCircle size={14} />
+            Chat
+          </button>
+          <button
+            onClick={startNewChat}
+            className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-medium text-slate-300"
+          >
+            <RefreshCw size={14} />
+            New Plan
+          </button>
+        </div>
       </div>
 
       {/* Overview */}
-      {plan!.overview && (
+      {plan.overview && (
         <div className="mb-4 rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-sm text-slate-300 leading-relaxed">{plan!.overview}</p>
+          <p className="text-sm text-slate-300 leading-relaxed">{plan.overview}</p>
         </div>
       )}
 
@@ -293,17 +277,17 @@ export default function TrainerPage() {
       <div className="mb-4 flex items-center gap-2">
         <div className="h-2 w-2 rounded-full bg-green-400" />
         <span className="text-xs text-slate-400">
-          Next up: Day {(plan!.currentDayIndex % plan!.days.length) + 1} —{" "}
-          {plan!.days[plan!.currentDayIndex % plan!.days.length]?.day_name}
+          Next up: Day {(plan.currentDayIndex % plan.days.length) + 1} —{" "}
+          {plan.days[plan.currentDayIndex % plan.days.length]?.day_name}
         </span>
       </div>
 
       {/* Workout days */}
       <div className="space-y-3">
-        {plan!.days.map((day) => {
+        {plan.days.map((day) => {
           const isNext =
             day.day_number ===
-            plan!.days[plan!.currentDayIndex % plan!.days.length]?.day_number;
+            plan.days[plan.currentDayIndex % plan.days.length]?.day_number;
           const isExpanded = expandedDay === day.day_number;
 
           return (
@@ -357,6 +341,7 @@ export default function TrainerPage() {
                         </p>
                         <p className="text-xs text-indigo-400">
                           {ex.sets} × {ex.reps} @ {ex.weight}lb
+                          {ex.rest_seconds ? ` · ${ex.rest_seconds}s rest` : ""}
                         </p>
                         {ex.notes && (
                           <p className="text-xs text-slate-600 mt-0.5">
