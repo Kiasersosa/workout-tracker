@@ -1,15 +1,30 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Plus, Trash2, ChevronDown, ChevronUp } from "lucide-react";
+import { Plus, Trash2, ChevronDown, ChevronUp, Check } from "lucide-react";
 import ExerciseBrowser from "./ExerciseBrowser";
 import {
   createWorkoutId,
   getNextWorkoutNumber,
-  getLastWorkoutForExercise,
   saveWorkoutSet,
 } from "@/lib/workout-helpers";
+import {
+  getNextWorkoutDay,
+  advanceWorkoutDay,
+  updatePlanWeights,
+  type WorkoutDay,
+  type PlannedExercise,
+} from "@/lib/training-plan-db";
+import { haptic } from "@/lib/haptics";
 import type { WorkoutSet } from "@/lib/db";
+
+const DIFFICULTY_OPTIONS = ["Easy", "Moderate", "Hard", "Impossible"];
+const DIFFICULTY_COLORS: Record<string, string> = {
+  Easy: "bg-green-600 text-white",
+  Moderate: "bg-yellow-600 text-white",
+  Hard: "bg-orange-600 text-white",
+  Impossible: "bg-red-600 text-white",
+};
 
 interface ExerciseEntry {
   exerciseName: string;
@@ -26,7 +41,7 @@ interface SetRow {
   targetWeight: number | null;
   actualReps: number | null;
   actualWeight: number | null;
-  rpe: number | null;
+  difficulty: string | null;
 }
 
 interface WorkoutSessionProps {
@@ -39,41 +54,51 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
   const [exercises, setExercises] = useState<ExerciseEntry[]>([]);
   const [showBrowser, setShowBrowser] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [plannedDay, setPlannedDay] = useState<WorkoutDay | null>(null);
 
   useEffect(() => {
     getNextWorkoutNumber().then(setWorkoutNumber);
+    loadPlannedWorkout();
   }, []);
 
-  const addExercise = useCallback(
-    async (exercise: { name: string; muscleGroup: string; equipment: string }) => {
-      // Smart prefill from last workout
-      const lastSets = await getLastWorkoutForExercise(exercise.name);
-      const prefillSets: SetRow[] =
-        lastSets.length > 0
-          ? lastSets.map((s, i) => ({
-              setNumber: i + 1,
-              targetReps: s.actualReps,
-              targetWeight: s.actualWeight,
-              actualReps: null,
-              actualWeight: s.actualWeight,
-              rpe: null,
-            }))
-          : [1, 2, 3].map((n) => ({
-              setNumber: n,
-              targetReps: null,
-              targetWeight: null,
-              actualReps: null,
-              actualWeight: null,
-              rpe: null,
-            }));
+  const loadPlannedWorkout = async () => {
+    const day = await getNextWorkoutDay();
+    if (day) {
+      setPlannedDay(day);
+      const entries: ExerciseEntry[] = day.exercises.map((ex) => ({
+        exerciseName: ex.exercise_name,
+        muscleGroup: ex.muscle_group || "",
+        equipment: "",
+        sets: Array.from({ length: ex.sets }, (_, i) => ({
+          setNumber: i + 1,
+          targetReps: ex.reps,
+          targetWeight: ex.weight,
+          actualReps: null,
+          actualWeight: ex.weight, // prefill with target
+          difficulty: null,
+        })),
+        collapsed: false,
+      }));
+      setExercises(entries);
+    }
+  };
 
+  const addExercise = useCallback(
+    (exercise: { name: string; muscleGroup: string; equipment: string }) => {
       setExercises((prev) => [
         ...prev,
         {
           exerciseName: exercise.name,
           muscleGroup: exercise.muscleGroup,
           equipment: exercise.equipment,
-          sets: prefillSets,
+          sets: [1, 2, 3].map((n) => ({
+            setNumber: n,
+            targetReps: null,
+            targetWeight: null,
+            actualReps: null,
+            actualWeight: null,
+            difficulty: null,
+          })),
           collapsed: false,
         },
       ]);
@@ -83,7 +108,7 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
   );
 
   const updateSet = useCallback(
-    (exerciseIndex: number, setIndex: number, field: keyof SetRow, value: number | null) => {
+    (exerciseIndex: number, setIndex: number, field: keyof SetRow, value: number | string | null) => {
       setExercises((prev) => {
         const next = [...prev];
         const exercise = { ...next[exerciseIndex] };
@@ -101,15 +126,16 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
     setExercises((prev) => {
       const next = [...prev];
       const exercise = { ...next[exerciseIndex] };
+      const lastSet = exercise.sets[exercise.sets.length - 1];
       exercise.sets = [
         ...exercise.sets,
         {
           setNumber: exercise.sets.length + 1,
-          targetReps: null,
-          targetWeight: null,
+          targetReps: lastSet?.targetReps ?? null,
+          targetWeight: lastSet?.targetWeight ?? null,
           actualReps: null,
-          actualWeight: null,
-          rpe: null,
+          actualWeight: lastSet?.targetWeight ?? null,
+          difficulty: null,
         },
       ];
       next[exerciseIndex] = exercise;
@@ -132,7 +158,7 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
     });
   }, []);
 
-  // Auto-save: debounced save to IndexedDB on every change
+  // Auto-save to IndexedDB
   useEffect(() => {
     const timeout = setTimeout(async () => {
       if (exercises.length === 0) return;
@@ -153,8 +179,8 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
             targetWeight: set.targetWeight,
             actualReps: set.actualReps,
             actualWeight: set.actualWeight,
-            rpe: set.rpe,
-            notes: "",
+            rpe: set.difficulty === "Easy" ? 5 : set.difficulty === "Moderate" ? 7 : set.difficulty === "Hard" ? 9 : set.difficulty === "Impossible" ? 10 : null,
+            notes: set.difficulty || "",
             syncedAt: null,
           };
           const id = await saveWorkoutSet(workoutSet);
@@ -167,11 +193,56 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
     return () => clearTimeout(timeout);
   }, [exercises, workoutId, workoutNumber]);
 
+  const handleFinish = async () => {
+    haptic("heavy");
+
+    // Adjust plan weights based on difficulty feedback
+    if (plannedDay) {
+      const updatedExercises: PlannedExercise[] = plannedDay.exercises.map((planEx) => {
+        const sessionEx = exercises.find((e) => e.exerciseName === planEx.exercise_name);
+        if (!sessionEx) return planEx;
+
+        // Check dominant difficulty across sets
+        const difficulties = sessionEx.sets
+          .map((s) => s.difficulty)
+          .filter(Boolean) as string[];
+
+        if (difficulties.length === 0) return planEx;
+
+        const counts: Record<string, number> = {};
+        difficulties.forEach((d) => (counts[d] = (counts[d] || 0) + 1));
+        const dominant = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+
+        const isLower = ["Quads", "Hamstrings", "Glutes", "Calves"].includes(
+          planEx.muscle_group || ""
+        );
+        const increment = isLower ? 10 : 5;
+
+        let newWeight = planEx.weight;
+        if (dominant === "Easy") {
+          newWeight = planEx.weight + increment;
+        } else if (dominant === "Impossible") {
+          newWeight = Math.round(planEx.weight * 0.9);
+        }
+        // Moderate and Hard keep the same weight
+
+        return { ...planEx, weight: newWeight };
+      });
+
+      await updatePlanWeights(plannedDay.day_number, updatedExercises);
+      await advanceWorkoutDay();
+    }
+
+    onFinish();
+  };
+
   return (
     <div className="flex flex-col px-4 pt-6 pb-24">
       <div className="mb-4 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Workout #{workoutNumber}</h1>
+          <h1 className="text-2xl font-bold">
+            {plannedDay ? plannedDay.day_name : `Workout #${workoutNumber}`}
+          </h1>
           <p className="text-xs text-slate-500">
             {new Date().toLocaleDateString("en-US", {
               weekday: "long",
@@ -182,9 +253,10 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
           </p>
         </div>
         <button
-          onClick={onFinish}
-          className="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-green-500"
+          onClick={handleFinish}
+          className="flex items-center gap-1.5 rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-green-500"
         >
+          <Check size={16} />
           Finish
         </button>
       </div>
@@ -204,7 +276,10 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
               <div>
                 <p className="font-semibold text-sm">{exercise.exerciseName}</p>
                 <p className="text-xs text-slate-500">
-                  {exercise.muscleGroup} · {exercise.sets.length} sets
+                  {exercise.sets.length} sets
+                  {exercise.sets[0]?.targetWeight
+                    ? ` · ${exercise.sets[0].targetWeight}lb × ${exercise.sets[0].targetReps}`
+                    : ""}
                 </p>
               </div>
             </button>
@@ -219,74 +294,70 @@ export default function WorkoutSession({ onFinish }: WorkoutSessionProps) {
           {!exercise.collapsed && (
             <div className="px-3 py-2">
               {/* Header row */}
-              <div className="grid grid-cols-[32px_1fr_1fr_1fr_48px] gap-1 mb-1 px-1">
+              <div className="grid grid-cols-[32px_1fr_1fr_1fr] gap-1 mb-1 px-1">
                 <span className="text-[10px] text-slate-600 text-center">SET</span>
-                <span className="text-[10px] text-slate-600 text-center">PREV</span>
                 <span className="text-[10px] text-slate-600 text-center">WEIGHT</span>
                 <span className="text-[10px] text-slate-600 text-center">REPS</span>
-                <span className="text-[10px] text-slate-600 text-center">RPE</span>
+                <span className="text-[10px] text-slate-600 text-center">FEEL</span>
               </div>
 
               {exercise.sets.map((set, setIdx) => (
-                <div
-                  key={set.setNumber}
-                  className="grid grid-cols-[32px_1fr_1fr_1fr_48px] gap-1 mb-1 items-center"
-                >
-                  <span className="text-center text-xs font-medium text-slate-500">
-                    {set.setNumber}
-                  </span>
-                  <span className="text-center text-xs text-slate-600">
-                    {set.targetWeight && set.targetReps
-                      ? `${set.targetWeight}×${set.targetReps}`
-                      : "—"}
-                  </span>
-                  <input
-                    type="number"
-                    inputMode="decimal"
-                    placeholder="0"
-                    value={set.actualWeight ?? ""}
-                    onChange={(e) =>
-                      updateSet(
-                        exIdx,
-                        setIdx,
-                        "actualWeight",
-                        e.target.value ? parseFloat(e.target.value) : null
-                      )
-                    }
-                    className="rounded-lg bg-slate-800 px-2 py-2 text-center text-sm text-white outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    placeholder="0"
-                    value={set.actualReps ?? ""}
-                    onChange={(e) =>
-                      updateSet(
-                        exIdx,
-                        setIdx,
-                        "actualReps",
-                        e.target.value ? parseInt(e.target.value) : null
-                      )
-                    }
-                    className="rounded-lg bg-slate-800 px-2 py-2 text-center text-sm text-white outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                  <input
-                    type="number"
-                    inputMode="decimal"
-                    placeholder="—"
-                    min={1}
-                    max={10}
-                    value={set.rpe ?? ""}
-                    onChange={(e) =>
-                      updateSet(
-                        exIdx,
-                        setIdx,
-                        "rpe",
-                        e.target.value ? parseFloat(e.target.value) : null
-                      )
-                    }
-                    className="rounded-lg bg-slate-800 px-2 py-2 text-center text-xs text-white outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
+                <div key={set.setNumber} className="mb-1">
+                  <div className="grid grid-cols-[32px_1fr_1fr_1fr] gap-1 items-center">
+                    <span className="text-center text-xs font-medium text-slate-500">
+                      {set.setNumber}
+                    </span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder={set.targetWeight ? String(set.targetWeight) : "0"}
+                      value={set.actualWeight ?? ""}
+                      onChange={(e) =>
+                        updateSet(
+                          exIdx,
+                          setIdx,
+                          "actualWeight",
+                          e.target.value ? parseFloat(e.target.value) : null
+                        )
+                      }
+                      className="rounded-lg bg-slate-800 px-2 py-2 text-center text-sm text-white outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      placeholder={set.targetReps ? String(set.targetReps) : "0"}
+                      value={set.actualReps ?? ""}
+                      onChange={(e) =>
+                        updateSet(
+                          exIdx,
+                          setIdx,
+                          "actualReps",
+                          e.target.value ? parseInt(e.target.value) : null
+                        )
+                      }
+                      className="rounded-lg bg-slate-800 px-2 py-2 text-center text-sm text-white outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                    {/* Difficulty selector */}
+                    <select
+                      value={set.difficulty ?? ""}
+                      onChange={(e) => {
+                        haptic("light");
+                        updateSet(exIdx, setIdx, "difficulty", e.target.value || null);
+                      }}
+                      className={`rounded-lg px-1 py-2 text-center text-xs font-medium outline-none ${
+                        set.difficulty
+                          ? DIFFICULTY_COLORS[set.difficulty]
+                          : "bg-slate-800 text-slate-500"
+                      }`}
+                    >
+                      <option value="">—</option>
+                      {DIFFICULTY_OPTIONS.map((d) => (
+                        <option key={d} value={d}>
+                          {d}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
               ))}
 

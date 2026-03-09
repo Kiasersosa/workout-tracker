@@ -2,12 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Dumbbell, ClipboardList, TrendingUp, Ruler, Settings } from "lucide-react";
+import { Dumbbell, Brain, TrendingUp, Ruler, Settings } from "lucide-react";
 import { haptic } from "@/lib/haptics";
 
 const navItems = [
   { href: "/", label: "Workout", icon: Dumbbell },
-  { href: "/routines", label: "Routines", icon: ClipboardList },
+  { href: "/trainer", label: "Trainer", icon: Brain },
   { href: "/progress", label: "Progress", icon: TrendingUp },
   { href: "/body", label: "Body", icon: Ruler },
   { href: "/settings", label: "Settings", icon: Settings },
